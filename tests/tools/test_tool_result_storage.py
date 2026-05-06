@@ -124,6 +124,34 @@ class TestWriteToSandbox:
         cmd = env.execute.call_args[0][0]
         assert "mkdir -p /data/data/com.termux/files/usr/tmp/hermes-results" in cmd
 
+    def test_path_with_spaces_is_quoted(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        remote_path = "/tmp/hermes results/abc file.txt"
+        _write_to_sandbox("content", remote_path, env)
+        cmd = env.execute.call_args[0][0]
+        assert "'/tmp/hermes results'" in cmd
+        assert "'/tmp/hermes results/abc file.txt'" in cmd
+
+    def test_shell_metacharacters_neutralized(self):
+        """Paths with shell metacharacters must be quoted to prevent injection."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        malicious_path = "/tmp/hermes-results/$(whoami).txt"
+        _write_to_sandbox("content", malicious_path, env)
+        cmd = env.execute.call_args[0][0]
+        # The $() must not appear unquoted — shlex.quote wraps it
+        assert "'/tmp/hermes-results/$(whoami).txt'" in cmd
+
+    def test_semicolon_injection_neutralized(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        malicious_path = "/tmp/x; rm -rf /; echo .txt"
+        _write_to_sandbox("content", malicious_path, env)
+        cmd = env.execute.call_args[0][0]
+        # The semicolons must be inside quotes, not acting as command separators
+        assert "'/tmp/x; rm -rf /; echo .txt'" in cmd
+
 
 class TestResolveStorageDir:
     def test_defaults_to_storage_dir_without_env(self):
@@ -488,12 +516,25 @@ class TestPerToolThresholds:
         except ImportError:
             pytest.skip("terminal_tool not importable in test env")
 
-    def test_read_file_never_persisted(self):
+    def test_read_file_result_size_cap(self):
         from tools.registry import registry
         try:
             import tools.file_tools  # noqa: F401
             val = registry.get_max_result_size("read_file")
-            assert val == float("inf")
+            assert val == 100_000
+        except ImportError:
+            pytest.skip("file_tools not importable in test env")
+
+    def test_read_file_registry_cap_is_100k(self):
+        """Regression test: read_file must have a 100_000 char registry cap (Layer 2 safety net)."""
+        from tools.registry import registry
+        try:
+            import tools.file_tools  # noqa: F401
+            val = registry.get_max_result_size("read_file")
+            assert val == 100_000, (
+                f"read_file registry cap must be 100_000, got {val!r}. "
+                "float('inf') is not allowed — it disables the Layer 2 result-size guard."
+            )
         except ImportError:
             pytest.skip("file_tools not importable in test env")
 

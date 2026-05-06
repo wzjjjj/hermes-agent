@@ -104,6 +104,134 @@ class TestGetAndPoll:
 
 
 # =========================================================================
+# Orphaned-pipe reconciliation (issue #17327)
+# =========================================================================
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: uses setsid/fcntl")
+class TestOrphanedPipeReconciliation:
+    """Regression tests for issue #17327.
+
+    `hermes update` in Feishu spawned a background subprocess that restarted
+    the gateway; the direct child exited quickly but a descendant daemon
+    held the stdout pipe open. `_reader_loop.finally` never ran, so
+    `session.exited` stayed False and the agent polled 74 times over 7
+    minutes, all returning `status: running`.
+
+    The fix is `_reconcile_local_exit()`: poll() and wait() now check the
+    direct `Popen.poll()` before trusting `session.exited`.
+    """
+
+    def test_reconcile_flips_exited_when_direct_child_done(self, registry):
+        """Direct child exited but reader thread is blocked on orphaned pipe."""
+        # Simulate the orphaned-pipe scenario: direct child exited, but a
+        # descendant holds stdout open so the reader never sees EOF.
+        # Approach: spawn `sh -c 'sleep 10 &'` with setsid — sh forks the
+        # sleep into a new session group, exits immediately, but sleep
+        # inherits the stdout pipe and keeps it open.
+        proc = subprocess.Popen(
+            ["sh", "-c", "exec 1>&2; ( sleep 30 ) & disown; exit 0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+        )
+
+        s = _make_session(sid="proc_orphan_test")
+        s.process = proc
+        s.pid = proc.pid
+        registry._running[s.id] = s
+
+        # Wait for the direct child to exit. We don't start a reader thread,
+        # so session.exited stays False (mimicking the stuck-reader state).
+        assert _wait_until(lambda: proc.poll() is not None, timeout=5.0), (
+            "Direct child should exit quickly (sh exits, sleep descendant "
+            "holds the pipe open)"
+        )
+
+        # Before the fix: poll would return "running" forever.
+        # After the fix: poll reconciles against proc.poll() and flips.
+        assert s.exited is False  # Precondition: reader hasn't updated it.
+        result = registry.poll(s.id)
+        assert result["status"] == "exited", (
+            f"Expected reconciled 'exited' status; got {result!r}. "
+            "This is issue #17327 — reader is blocked on orphaned pipe."
+        )
+        assert result["exit_code"] == 0
+        assert s.exited is True
+        assert s.id in registry._finished
+        assert s.id not in registry._running
+
+        # Clean up the orphaned descendant.
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def test_reconcile_noop_when_child_still_running(self, registry):
+        """Reconcile must NOT flip exited when the direct child is alive."""
+        proc = _spawn_python_sleep(5.0)
+        s = _make_session(sid="proc_running_test")
+        s.process = proc
+        s.pid = proc.pid
+        registry._running[s.id] = s
+
+        result = registry.poll(s.id)
+        assert result["status"] == "running"
+        assert s.exited is False
+
+        proc.kill()
+        proc.wait()
+
+    def test_reconcile_noop_on_already_exited(self, registry):
+        """Reconcile is a no-op when session.exited is already True."""
+        s = _make_session(sid="proc_already_exited", exited=True, exit_code=7)
+        s.process = MagicMock()
+        s.process.poll = MagicMock(return_value=0)  # Would say exit 0
+        registry._finished[s.id] = s
+
+        registry._reconcile_local_exit(s)
+        # Must not overwrite the existing exit_code with proc.poll()'s 0.
+        assert s.exit_code == 7
+
+    def test_reconcile_noop_on_no_process(self, registry):
+        """Reconcile is a no-op for sessions without a local Popen (env/PTY)."""
+        s = _make_session(sid="proc_no_popen")
+        assert getattr(s, "process", None) is None
+        # Must not raise.
+        registry._reconcile_local_exit(s)
+        assert s.exited is False
+
+    def test_wait_returns_when_reader_blocked(self, registry):
+        """wait() must also reconcile — not just poll()."""
+        proc = subprocess.Popen(
+            ["sh", "-c", "( sleep 30 ) & disown; exit 0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+        )
+
+        s = _make_session(sid="proc_wait_orphan")
+        s.process = proc
+        s.pid = proc.pid
+        registry._running[s.id] = s
+
+        assert _wait_until(lambda: proc.poll() is not None, timeout=5.0)
+
+        start = time.monotonic()
+        result = registry.wait(s.id, timeout=10)
+        elapsed = time.monotonic() - start
+
+        assert result["status"] == "exited", result
+        assert elapsed < 5.0, (
+            f"wait() should return ~immediately via reconcile; took {elapsed:.1f}s"
+        )
+
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+# =========================================================================
 # Read log
 # =========================================================================
 
@@ -438,6 +566,8 @@ class TestCheckpoint:
             s = _make_session()
             s.watcher_platform = "telegram"
             s.watcher_chat_id = "999"
+            s.watcher_user_id = "u123"
+            s.watcher_user_name = "alice"
             s.watcher_thread_id = "42"
             s.watcher_interval = 60
             registry._running[s.id] = s
@@ -447,6 +577,8 @@ class TestCheckpoint:
             assert len(data) == 1
             assert data[0]["watcher_platform"] == "telegram"
             assert data[0]["watcher_chat_id"] == "999"
+            assert data[0]["watcher_user_id"] == "u123"
+            assert data[0]["watcher_user_name"] == "alice"
             assert data[0]["watcher_thread_id"] == "42"
             assert data[0]["watcher_interval"] == 60
 
@@ -460,6 +592,8 @@ class TestCheckpoint:
             "session_key": "sk1",
             "watcher_platform": "telegram",
             "watcher_chat_id": "123",
+            "watcher_user_id": "u123",
+            "watcher_user_name": "alice",
             "watcher_thread_id": "42",
             "watcher_interval": 60,
         }]))
@@ -471,6 +605,8 @@ class TestCheckpoint:
             assert w["session_id"] == "proc_live"
             assert w["platform"] == "telegram"
             assert w["chat_id"] == "123"
+            assert w["user_id"] == "u123"
+            assert w["user_name"] == "alice"
             assert w["thread_id"] == "42"
             assert w["check_interval"] == 60
 
